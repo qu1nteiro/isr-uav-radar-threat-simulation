@@ -1,0 +1,37 @@
+# Virtual environment (initialised inside src/)
+src/.venv/
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Generated figures and results (large files; commit selectively)
+results/figures/*.png
+results/figures/*.pdf
+results/figures/*.svg
+
+# Typst compilation artefacts
+docs/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+*.swp
