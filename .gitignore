@@ -19,6 +19,7 @@ __pycache__/
 results/figures/*.png
 results/figures/*.pdf
 results/figures/*.svg
+results/figures/*.gif
 
 # Typst compilation artefacts
 docs/*.pdf

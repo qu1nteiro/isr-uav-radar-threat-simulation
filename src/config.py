@@ -41,6 +41,8 @@ UAV_STEP_SIZE   = 0.65       # mean displacement per step [units]
 DRIFT_WEIGHT    = 0.45   # era 0.65                     #DRIFT_WEIGHT    = 0.65       # [0, 1] — how strongly the UAV biases toward the target
                              # 1.0 = straight line; 0.0 = pure random walk
 
+DRONE_REPULSION_WEIGHT = 0.2   # constante — força corredores distintos
+
 # Lévy flight parameters (used in Stage 3 variant)
 LEVY_ALPHA      = 1.5        # stability index μ [1, 2]; 2 → Gaussian, 1 → Cauchy
                              # literature value for animal search: 1.4–2.0

@@ -1,407 +1,642 @@
 """
-animate_mission.py — Step-by-step animation of a single UAV mission.
+animate_mission.py — GIF animations for solo and cooperative ELINT missions.
 
-Renders the AR3 moving through the contested radar environment frame by frame.
-Saves the result as mission_animation.gif in results/figures/.
+Visual style: military/ISR surveillance software aesthetic.
+
+Generates 4 animated GIFs:
+    solo_gaussian.gif   — single ELINT drone, Gaussian walk
+    solo_levy.gif       — single ELINT drone, Lévy walk
+    coop_gaussian.gif   — two cooperative ELINT drones, Gaussian walk
+    coop_levy.gif       — two cooperative ELINT drones, Lévy walk
 
 Usage
 -----
-    python src/animate_mission.py              # default seed
-    python src/animate_mission.py --seed 7     # specific seed
-    python src/animate_mission.py --radars 8   # number of radars
+    python src/animate_mission.py
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.animation as animation
-from matplotlib.colors import LinearSegmentedColormap
-import argparse
-import os
-import sys
+from matplotlib.patches import Circle, FancyArrow, Rectangle
+from matplotlib.lines import Line2D
+import matplotlib.colors as mcolors
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
 
 import config
-from radar_detection import detection_probability, detection_event
+from radar_detection import global_detection
+from network_builder import build_network
+from uav_elint_trajectory import ELINTMap, _propagate_alerts, _decay_alerts
+from cooperative_elint import _safe_step, _direction_vector, _levy_step
+
+# ─── Palette ──────────────────────────────────────────────────────────────────
+BG          = "#0d1117"
+GRID_COL    = "#1f2937"
+AXES_COL    = "#374151"
+TEXT_DIM    = "#6b7280"
+TEXT_MID    = "#94a3b8"
+TEXT_BRIGHT = "#e2e8f0"
+DRONE_A     = "#38bdf8"
+DRONE_B     = "#c084fc"
+KNOWN_COL   = "#f97316"
+UNKNOWN_COL = "#dc262630"
+SUCCESS_COL = "#22c55e"
+DETECT_COL  = "#ef4444"
+TIMEOUT_COL = "#6b7280"
+BAR_OK      = "#22c55e"
+BAR_DET     = "#ef4444"
+
+N_FRAMES = 200
+FPS      = 20
+DPI      = 110
 
 
-# ─── Colours ──────────────────────────────────────────────────────────────────
+# ─── Detection probability helper ────────────────────────────────────────────
 
-C_SUCCESS  = "#0F6E56"
-C_DETECTED = "#993C1D"
-C_TIMEOUT  = "#5F5E5A"
-C_RADAR    = "#A32D2D"
-C_UAV      = "#185FA5"
-C_TARGET   = "#3B6D11"
-C_TRAIL    = "#2563eb"
-C_ALERT    = "#dc2626"
-
-TRAIL_LEN  = 40      # number of past positions to show as trail
+def _max_pd(pos, radar_positions, alert_states):
+    """Maximum instantaneous detection probability across all radars."""
+    d = np.linalg.norm(radar_positions - pos, axis=1)
+    p = np.where(d <= config.RADAR_RANGE,
+                 np.exp(-d / config.DETECTION_LAMBDA), 0.0)
+    amp = 1.0 + config.ALERT_GAMMA * (alert_states > 0).astype(float)
+    return float(np.clip(p * amp, 0, 1).max()) if len(p) else 0.0
 
 
-# ─── Pre-compute full trajectory ──────────────────────────────────────────────
+# ─── Heatmap helper ───────────────────────────────────────────────────────────
 
-def run_mission(radar_positions, rng):
-    """
-    Simulate a full mission and return every step.
-
-    Returns
-    -------
-    steps : list of dict
-        One dict per step with keys:
-            x, y         — UAV position
-            p_max        — highest P_eff at this step
-            detected     — bool, was the UAV detected this step?
-            det_radar_id — index of detecting radar, or None
-    outcome : str  — 'success' | 'detected' | 'timeout'
-    """
-    x, y   = config.UAV_START
-    tx, ty = config.MISSION_TARGET
-    s      = config.UAV_STEP_SIZE
-    alpha  = config.DRIFT_WEIGHT
-
-    steps   = [{"x": x, "y": y, "p_max": 0.0,
-                 "detected": False, "det_radar_id": None}]
-    outcome = "timeout"
-
-    for _ in range(config.MAX_STEPS):
-        dx, dy   = tx - x, ty - y
-        dist_tgt = np.sqrt(dx**2 + dy**2)
-
-        if dist_tgt <= config.TARGET_RADIUS:
-            outcome = "success"
-            break
-
-        e_tgt  = np.array([dx, dy]) / dist_tgt
-        theta  = rng.uniform(0, 2 * np.pi)
-        e_rand = np.array([np.cos(theta), np.sin(theta)])
-
-        v     = alpha * e_tgt + (1 - alpha) * e_rand
-        v_n   = np.linalg.norm(v)
-        v     = v / v_n if v_n > 1e-9 else e_rand
-
-        x = float(np.clip(x + s * v[0], 0, config.GRID_SIZE))
-        y = float(np.clip(y + s * v[1], 0, config.GRID_SIZE))
-
-        uav_pos = np.array([x, y])
-        p_max   = 0.0
-        step_detected   = False
-        det_radar_id    = None
-
-        for i, rp in enumerate(radar_positions):
-            d = float(np.linalg.norm(uav_pos - rp))
-            p = float(detection_probability(d, rng=rng))
-            p_max = max(p_max, p)
-            if not step_detected and detection_event(p, rng=rng):
-                step_detected = True
-                det_radar_id  = i
-
-        steps.append({"x": x, "y": y, "p_max": p_max,
-                      "detected": step_detected,
-                      "det_radar_id": det_radar_id})
-
-        if step_detected:
-            outcome = "detected"
-            break
-
-    return steps, outcome
-
-
-# ─── Heatmap ──────────────────────────────────────────────────────────────────
-
-def build_heatmap(radar_positions, resolution=200):
+def _heatmap(radar_positions, res=120):
     L  = config.GRID_SIZE
-    xs = np.linspace(0, L, resolution)
-    ys = np.linspace(0, L, resolution)
-    Xg, Yg    = np.meshgrid(xs, ys)
-    P_survive = np.ones((resolution, resolution))
+    xs = np.linspace(0, L, res)
+    ys = np.linspace(0, L, res)
+    Xg, Yg = np.meshgrid(xs, ys)
+    P = np.ones((res, res))
     for rp in radar_positions:
-        D  = np.sqrt((Xg - rp[0])**2 + (Yg - rp[1])**2)
+        D  = np.sqrt((Xg-rp[0])**2 + (Yg-rp[1])**2)
         Pi = np.where(D <= config.RADAR_RANGE,
                       np.exp(-D / config.DETECTION_LAMBDA), 0.0)
-        P_survive *= (1.0 - Pi)
-    return Xg, Yg, 1.0 - P_survive
+        P *= (1.0 - Pi)
+    return Xg, Yg, 1.0 - P
 
 
-# ─── Animation ────────────────────────────────────────────────────────────────
+# ─── Mission recorders ────────────────────────────────────────────────────────
 
-def animate(n_radars=8, seed=None, save=True, show=True, interval=30):
+def record_solo(radar_positions, G, rng, walk="gaussian", beta=None):
+    beta     = beta or config.ELINT_BETA
+    N        = len(radar_positions)
+    tgt      = np.array(config.MISSION_TARGET)
+    use_levy = (walk == "levy")
+
+    pos    = np.array(config.UAV_START, dtype=float)
+    elint  = ELINTMap(N)
+    alerts = np.zeros(N, dtype=int)
+
+    positions    = [pos.copy()]
+    known_masks  = [elint.known.copy()]
+    alert_states = [alerts.copy()]
+    pd_history   = [0.0]
+
+    outcome = "timeout"; det_pos = None
+
+    for t in range(config.MAX_STEPS):
+        if np.linalg.norm(pos - tgt) <= config.TARGET_RADIUS:
+            outcome = "success"; break
+
+        elint.update(pos, radar_positions, t)
+        kp = elint.known_positions(radar_positions)
+        d  = _direction_vector(pos, kp, rng, beta)
+        s  = _safe_step(pos, d,
+                        _levy_step(rng) if use_levy else config.UAV_STEP_SIZE, kp)
+        pos = np.clip(pos + s * d, 0.0, config.GRID_SIZE)
+
+        det, ids, _ = global_detection(
+            uav_pos=pos, radar_positions=radar_positions,
+            alert_states=alerts, rng=rng)
+        if det:
+            outcome = "detected"; det_pos = tuple(pos); break
+        if len(ids) > 0:
+            _propagate_alerts(G, ids, alerts)
+        _decay_alerts(alerts)
+
+        positions.append(pos.copy())
+        known_masks.append(elint.known.copy())
+        alert_states.append(alerts.copy())
+        pd_history.append(_max_pd(pos, radar_positions, alerts))
+
+    return {"positions": np.array(positions), "known_masks": known_masks,
+            "alert_states": alert_states, "pd_history": pd_history,
+            "outcome": outcome, "det_pos": det_pos,
+            "n_steps": len(positions)-1, "n_radars": N}
+
+
+def record_coop(radar_positions, G, rng_a, rng_b, walk="gaussian", beta=None):
+    beta     = beta or config.ELINT_BETA
+    N        = len(radar_positions)
+    tgt      = np.array(config.MISSION_TARGET)
+    use_levy = (walk == "levy")
+
+    pos_a = np.array(config.UAV_START_A, dtype=float)
+    pos_b = np.array(config.UAV_START_B, dtype=float)
+    ea    = ELINTMap(N); eb = ELINTMap(N)
+    alerts = np.zeros(N, dtype=int)
+
+    traj_a = [pos_a.copy()]; traj_b = [pos_b.copy()]
+    known_sh = [(ea.known | eb.known).copy()]
+    pd_a_hist = [0.0]; pd_b_hist = [0.0]
+
+    out_a="timeout"; out_b="timeout"; det_a=None; det_b=None
+    done_a=False;    done_b=False
+
+    for t in range(config.MAX_STEPS):
+        if not done_a and np.linalg.norm(pos_a-tgt) <= config.TARGET_RADIUS:
+            out_a="success"; done_a=True
+        if not done_b and np.linalg.norm(pos_b-tgt) <= config.TARGET_RADIUS:
+            out_b="success"; done_b=True
+        if done_a and done_b: break
+
+        if not done_a: ea.update(pos_a, radar_positions, t)
+        if not done_b: eb.update(pos_b, radar_positions, t)
+
+        shared = ea.known | eb.known
+        ea.known[:] = shared; eb.known[:] = shared
+
+        if not done_a:
+            kp = ea.known_positions(radar_positions)
+            d  = _direction_vector(pos_a, kp, rng_a, beta,
+                                   partner_pos=pos_b if not done_b else None)
+            s  = _safe_step(pos_a, d,
+                            _levy_step(rng_a) if use_levy else config.UAV_STEP_SIZE, kp)
+            pos_a = np.clip(pos_a + s*d, 0, config.GRID_SIZE)
+            traj_a.append(pos_a.copy())
+
+        if not done_b:
+            kp = eb.known_positions(radar_positions)
+            d  = _direction_vector(pos_b, kp, rng_b, beta,
+                                   partner_pos=pos_a if not done_a else None)
+            s  = _safe_step(pos_b, d,
+                            _levy_step(rng_b) if use_levy else config.UAV_STEP_SIZE, kp)
+            pos_b = np.clip(pos_b + s*d, 0, config.GRID_SIZE)
+            traj_b.append(pos_b.copy())
+
+        if not done_a:
+            det, ids, _ = global_detection(
+                uav_pos=pos_a, radar_positions=radar_positions,
+                alert_states=alerts, rng=rng_a)
+            if det:
+                out_a="detected"; det_a=tuple(pos_a); done_a=True
+                if len(ids)>0: _propagate_alerts(G, ids, alerts)
+
+        if not done_b:
+            det, ids, _ = global_detection(
+                uav_pos=pos_b, radar_positions=radar_positions,
+                alert_states=alerts, rng=rng_b)
+            if det:
+                out_b="detected"; det_b=tuple(pos_b); done_b=True
+                if len(ids)>0: _propagate_alerts(G, ids, alerts)
+
+        _decay_alerts(alerts)
+        T = max(len(traj_a), len(traj_b))
+        known_sh.append(shared.copy())
+        pd_a_hist.append(_max_pd(pos_a, radar_positions, alerts) if not done_a else pd_a_hist[-1])
+        pd_b_hist.append(_max_pd(pos_b, radar_positions, alerts) if not done_b else pd_b_hist[-1])
+
+        if done_a and done_b: break
+
+    T = max(len(traj_a), len(traj_b))
+    while len(traj_a)<T: traj_a.append(traj_a[-1])
+    while len(traj_b)<T: traj_b.append(traj_b[-1])
+    while len(known_sh)<T: known_sh.append(known_sh[-1])
+
+    joint = ("both_success" if out_a=="success" and out_b=="success"
+             else "one_success" if out_a=="success" or out_b=="success"
+             else "both_failed")
+
+    return {"positions_a": np.array(traj_a), "positions_b": np.array(traj_b),
+            "known_shared": known_sh, "pd_a": pd_a_hist, "pd_b": pd_b_hist,
+            "out_a": out_a, "out_b": out_b, "joint": joint,
+            "det_a": det_a, "det_b": det_b,
+            "n_steps": T-1, "n_radars": N}
+
+
+# ─── Shared figure setup (ISR/surveillance aesthetic) ────────────────────────
+
+def _make_fig(N_radars, seed, subtitle="", n_hud_lines=3):
     """
-    Build and optionally save the mission animation.
-
-    Parameters
-    ----------
-    n_radars : int
-        Number of radar nodes.
-    seed : int or None
-    save : bool
-        Save as .gif to results/figures/.
-    show : bool
-        Call plt.show() after building.
-    interval : int
-        Milliseconds between frames.
+    Create the ISR display figure.
+    HUD shows live coordinates, heading, P(d) — no progress bar.
+    n_hud_lines: 3 for solo, 4 for coop (extra drone B line).
     """
-    seed = seed if seed is not None else config.RANDOM_SEED
-    rng  = np.random.default_rng(seed)
-    L    = config.GRID_SIZE
+    L       = config.GRID_SIZE
+    hud_h   = 0.04 + n_hud_lines * 0.038   # dynamic height for HUD
+    plot_b  = hud_h + 0.02                 # bottom of main axes
+    fig     = plt.figure(figsize=(8.8, 9.2), dpi=DPI)
+    fig.patch.set_facecolor(BG)
 
-    # ── Place radars ──────────────────────────────────────────────────────────
-    margin          = config.RADAR_RANGE * 0.6
-    radar_positions = rng.uniform(margin, L - margin, size=(n_radars, 2))
+    # Main radar display
+    ax = fig.add_axes([0.08, plot_b + 0.01, 0.88, 0.97 - plot_b - 0.07])
+    ax.set_facecolor(BG)
+    ax.set_xlim(0, L); ax.set_ylim(0, L)
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x_1$  [spatial units ≈ km]", color=TEXT_DIM, fontsize=8)
+    ax.set_ylabel("$x_2$  [spatial units ≈ km]", color=TEXT_DIM, fontsize=8, labelpad=2)
+    ax.tick_params(colors=TEXT_DIM, labelsize=7)
+    for sp in ax.spines.values():
+        sp.set_color(AXES_COL)
+    ax.grid(True, color=GRID_COL, linewidth=0.3, alpha=0.8, zorder=0)
+    for y in np.arange(0, L, 20):
+        ax.axhspan(y, y+10, color="white", alpha=0.007, zorder=0)
 
-    # ── Simulate ──────────────────────────────────────────────────────────────
-    steps, outcome = run_mission(radar_positions, rng)
-    n_frames       = len(steps)
+    # Title bar
+    fig.text(0.50, 0.985,
+             f"AR3 ISR Mission Simulation  —  N = {N_radars} radars · seed {seed}",
+             ha="center", va="top", color=TEXT_BRIGHT, fontsize=9.5,
+             fontfamily="monospace", fontweight="bold")
+    fig.text(0.50, 0.966, subtitle,
+             ha="center", va="top", color=TEXT_MID, fontsize=8,
+             fontfamily="monospace")
 
-    print(f"  Seed {seed} | {n_radars} radars | {n_frames} steps | outcome: {outcome}")
+    # HUD divider
+    fig.add_artist(plt.matplotlib.lines.Line2D(
+        [0.04, 0.96], [plot_b, plot_b], transform=fig.transFigure,
+        color=AXES_COL, lw=0.8))
 
-    # ── Heatmap ───────────────────────────────────────────────────────────────
-    Xg, Yg, P_field = build_heatmap(radar_positions)
+    # HUD text lines (dynamic)
+    line_ys  = [plot_b - 0.006 - i * 0.038 for i in range(n_hud_lines)]
+    hud_texts = [fig.text(0.05, y, "", color=TEXT_BRIGHT,
+                          fontsize=8, fontfamily="monospace", va="top")
+                 for y in line_ys]
 
-    cmap_danger = LinearSegmentedColormap.from_list(
-        "danger",
-        [(0.0, "#0a0a0a00"),
-         (0.1, "#7f1d1d22"),
-         (0.5, "#991b1b88"),
-         (1.0, "#dc2626cc")],
-        N=256
+    # ELINT coverage bar — matplotlib Rectangle (guaranteed rendering)
+    bar_ax = fig.add_axes([0.05, 0.012, 0.90, 0.022])
+    bar_ax.set_facecolor("#111827")
+    bar_ax.set_xlim(0, 1); bar_ax.set_ylim(0, 1)
+    bar_ax.axis("off")
+    bar_fill = bar_ax.add_patch(
+        __import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+            (0, 0.1), 0.001, 0.8, color=DRONE_A, zorder=3))
+    bar_label = bar_ax.text(0.5, 0.5, "ELINT MAP  0 / 0   0%",
+                             ha="center", va="center", color=TEXT_DIM,
+                             fontsize=7, fontfamily="monospace",
+                             transform=bar_ax.transAxes, zorder=4)
+    # Border
+    for spine in ["top","bottom","left","right"]:
+        bar_ax.spines[spine].set_color(AXES_COL)
+        bar_ax.spines[spine].set_linewidth(0.5)
+        bar_ax.spines[spine].set_visible(True)
+
+    return fig, ax, hud_texts, bar_fill, bar_label
+
+
+def _update_hud_solo(texts, bar_fill, bar_label,
+                     step, total_steps, pos, pd, n_known, N, outcome=None):
+    """Update 3-line solo HUD + matplotlib bar."""
+    t     = step * config.STEP_DURATION_S / 60.0
+    t_tot = total_steps * config.STEP_DURATION_S / 60.0
+    dx    = config.MISSION_TARGET[0] - pos[0]
+    dy    = config.MISSION_TARGET[1] - pos[1]
+    hdg   = int(np.degrees(np.arctan2(dx, dy)) % 360)
+    status = f"  ►  {outcome.upper()}" if outcome else ""
+    col0   = (SUCCESS_COL if outcome=="success"
+              else DETECT_COL if outcome=="detected" else TEXT_BRIGHT)
+    pd_col = DETECT_COL if pd>0.3 else "#f59e0b" if pd>0.1 else TEXT_DIM
+
+    texts[0].set_text(
+        f"STEP  {step:>5d} / {total_steps}   |   T = {t:>6.1f} / {t_tot:.0f} min{status}")
+    texts[0].set_color(col0)
+    texts[1].set_text(
+        f"x1 = {pos[0]:>7.2f} km     x2 = {pos[1]:>7.2f} km     HDG = {hdg:>03d} deg")
+    texts[1].set_color(TEXT_MID)
+    texts[2].set_text(f"Max P(d) = {pd*100:>5.1f}%   |   ELINT  {n_known:>2d} / {N} radars identified")
+    texts[2].set_color(pd_col)
+
+    # matplotlib bar
+    frac = n_known / max(N, 1)
+    bar_fill.set_width(max(frac, 0.002))
+    bar_fill.set_color(SUCCESS_COL if outcome=="success"
+                       else DETECT_COL if outcome=="detected" else DRONE_A)
+    bar_label.set_text(
+        f"ELINT MAP   {n_known} / {N} radars   {int(frac*100)}%")
+
+
+def _update_hud_coop(texts, bar_fill, bar_label,
+                     step, total_steps,
+                     pos_a, pos_b, pd_a, pd_b,
+                     n_shared, N, out_a=None, out_b=None):
+    """Update 4-line coop HUD + matplotlib bar."""
+    t      = step * config.STEP_DURATION_S / 60.0
+    t_tot  = total_steps * config.STEP_DURATION_S / 60.0
+    j_ok   = out_a=="success" and out_b=="success"
+    any_ok = out_a=="success" or out_b=="success"
+    status = ("  ►  BOTH SUCCESS" if j_ok
+              else "  ►  ONE SUCCESS" if any_ok
+              else "  ►  BOTH DETECTED" if (out_a and out_b) else "")
+    col0   = SUCCESS_COL if j_ok else "#f59e0b" if any_ok else TEXT_BRIGHT
+
+    def _line(pos, pd, out, marker):
+        col = (SUCCESS_COL if out=="success"
+               else DETECT_COL if out=="detected" else TEXT_MID)
+        alert = " [ALERT]" if pd>0.3 else " [WARN] " if pd>0.1 else "        "
+        return (f"{marker}  x1={pos[0]:>7.2f}  x2={pos[1]:>7.2f}"
+                f"  P(d)={pd*100:>4.1f}%{alert}"), col
+
+    la, ca = _line(pos_a, pd_a, out_a, "A *")
+    lb, cb = _line(pos_b, pd_b, out_b, "B *")
+
+    texts[0].set_text(
+        f"STEP  {step:>5d} / {total_steps}   |   T = {t:>6.1f} / {t_tot:.0f} min{status}")
+    texts[0].set_color(col0)
+    texts[1].set_text(la); texts[1].set_color(ca)
+    texts[2].set_text(lb); texts[2].set_color(cb)
+    texts[3].set_text(f"COOPERATIVE ELINT MAP:  {n_shared} / {N} radars  [{int(n_shared/max(N,1)*100)}% identified]")
+    texts[3].set_color(TEXT_DIM)
+
+    # matplotlib bar
+    frac = n_shared / max(N, 1)
+    bar_fill.set_width(max(frac, 0.002))
+    bar_fill.set_color(SUCCESS_COL if j_ok else "#f59e0b" if any_ok else DRONE_B)
+    bar_label.set_text(f"SHARED MAP   {n_shared} / {N}   {int(frac*100)}%")
+
+
+# ─── Solo GIF ─────────────────────────────────────────────────────────────────
+
+def make_solo_gif(rec, radar_positions, walk_label, seed, output_path):
+    from matplotlib.colors import LinearSegmentedColormap
+    L   = config.GRID_SIZE
+    N   = rec["n_radars"]
+    Xg, Yg, P_heat = _heatmap(radar_positions)
+
+    step_idx = np.unique(np.round(
+        np.linspace(0, len(rec["positions"])-1, N_FRAMES)
+    ).astype(int))
+
+    cmap_d = LinearSegmentedColormap.from_list("d",
+        [(0,"#dc262600"),(0.3,"#dc262620"),
+         (0.6,"#dc262660"),(1,"#dc2626cc")], N=256)
+
+    outcome = rec["outcome"]
+
+    fig, ax, hud_texts, bar_fill, bar_label = _make_fig(
+        N, seed, n_hud_lines=3,
+        subtitle=f"Solo ELINT  ·  {walk_label}  ·  β* = {config.ELINT_BETA}"
     )
 
-    # ── Figure ────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(8, 8.6), constrained_layout=False)
-    fig.patch.set_facecolor("#0d1117")
+    ax.pcolormesh(Xg, Yg, P_heat, cmap=cmap_d, vmin=0, vmax=1,
+                  shading="gouraud", rasterized=True, zorder=1)
 
-    # Main axes (map)
-    ax = fig.add_axes([0.07, 0.13, 0.82, 0.82])
-    ax.set_facecolor("#0d1117")
+    # ELINT rings
+    for rp in radar_positions:
+        ax.add_patch(Circle(rp, config.ELINT_RANGE, fill=False,
+                            edgecolor="#f9731618", lw=0.6,
+                            linestyle=":", zorder=2))
 
-    # ── Static layers ─────────────────────────────────────────────────────────
-    ax.pcolormesh(Xg, Yg, P_field,
-                  cmap=cmap_danger, vmin=0, vmax=1,
+    # Target
+    ax.add_patch(Circle(config.MISSION_TARGET, config.TARGET_RADIUS,
+                        fill=True, facecolor="#22c55e18",
+                        edgecolor="#22c55e", lw=1.2, zorder=3))
+    ax.scatter(*config.MISSION_TARGET, s=80, c=SUCCESS_COL,
+               marker="*", zorder=10, edgecolors=BG, lw=0.8)
+
+    # Start
+    ax.scatter(*config.UAV_START, s=55, c=DRONE_A,
+               marker="o", zorder=10, edgecolors=BG, lw=1.0)
+
+    # Animated elements
+    trail, = ax.plot([], [], color=DRONE_A, lw=1.0, alpha=0.6, zorder=5)
+    dot,   = ax.plot([], [], "o", color=DRONE_A, ms=7, zorder=11,
+                     mec=BG, mew=1.0)
+
+    radar_sc = ax.scatter(radar_positions[:,0], radar_positions[:,1],
+                          s=22, c=[UNKNOWN_COL]*N, marker="^",
+                          zorder=6, edgecolors="none")
+
+    det_rings = [Circle(rp, config.RADAR_RANGE, fill=False,
+                        edgecolor=UNKNOWN_COL, lw=0.5,
+                        linestyle="--", zorder=4)
+                 for rp in radar_positions]
+    for r in det_rings: ax.add_patch(r)
+
+    # Range indicator
+    range_circle = ax.add_patch(
+        Circle((0,0), config.ELINT_RANGE, fill=False,
+               edgecolor="#f9731640", lw=0.6, linestyle=":", zorder=3)
+    )
+
+    total_steps = rec["n_steps"]
+
+    def _update(fi):
+        si   = step_idx[fi]
+        si   = min(si, len(rec["positions"])-1)
+        pos  = rec["positions"][si]
+        mask = rec["known_masks"][min(si, len(rec["known_masks"])-1)]
+        alrt = rec["alert_states"][min(si, len(rec["alert_states"])-1)]
+        pd   = rec["pd_history"][min(si, len(rec["pd_history"])-1)]
+
+        lo = max(0, si-80)
+        trail.set_data(rec["positions"][lo:si+1, 0],
+                       rec["positions"][lo:si+1, 1])
+        dot.set_data([pos[0]], [pos[1]])
+        range_circle.center = pos
+
+        # Alert flicker
+        dot.set_color(DETECT_COL if pd > 0.3 else
+                      "#f59e0b"  if pd > 0.1 else DRONE_A)
+
+        cols = [KNOWN_COL if mask[i] else
+                ("#ef444460" if alrt[i] > 0 else UNKNOWN_COL)
+                for i in range(N)]
+        radar_sc.set_color(cols)
+
+        for i, ring in enumerate(det_rings):
+            if mask[i]:
+                ring.set_edgecolor(KNOWN_COL); ring.set_alpha(0.7)
+                ring.set_linewidth(0.9)
+            elif alrt[i] > 0:
+                ring.set_edgecolor("#ef4444"); ring.set_alpha(0.5)
+                ring.set_linewidth(0.7)
+            else:
+                ring.set_edgecolor(UNKNOWN_COL); ring.set_alpha(0.3)
+                ring.set_linewidth(0.4)
+
+        fin_outcome = outcome if fi == len(step_idx)-1 else None
+        _update_hud_solo(hud_texts, bar_fill, bar_label,
+                         si, total_steps, pos, pd,
+                         int(mask.sum()), N, outcome=fin_outcome)
+
+        return trail, dot, radar_sc, range_circle, *hud_texts, *det_rings
+
+    ani = animation.FuncAnimation(fig, _update, frames=len(step_idx),
+                                  interval=1000//FPS, blit=True)
+    ani.save(output_path, writer="pillow", fps=FPS)
+    plt.close(fig)
+    print(f"  Saved → {output_path}")
+
+
+# ─── Cooperative GIF ──────────────────────────────────────────────────────────
+
+def make_coop_gif(rec, radar_positions, walk_label, seed, output_path):
+    from matplotlib.colors import LinearSegmentedColormap
+    L   = config.GRID_SIZE
+    N   = rec["n_radars"]
+    Xg, Yg, P_heat = _heatmap(radar_positions)
+
+    step_idx = np.unique(np.round(
+        np.linspace(0, len(rec["positions_a"])-1, N_FRAMES)
+    ).astype(int))
+
+    cmap_d = LinearSegmentedColormap.from_list("d",
+        [(0,"#dc262600"),(0.3,"#dc262620"),
+         (0.6,"#dc262660"),(1,"#dc2626cc")], N=256)
+
+    joint = rec["joint"]
+
+    fig, ax, hud_texts, bar_fill, bar_label = _make_fig(
+        N, seed, n_hud_lines=4,
+        subtitle=f"Cooperative ELINT  ·  {walk_label}  ·  β* = {config.ELINT_BETA}"
+                 f"  ·  ΔStart = {int(config.UAV_START_B[1]-config.UAV_START_A[1])} u"
+    )
+
+    ax.pcolormesh(Xg, Yg, P_heat, cmap=cmap_d, vmin=0, vmax=1,
                   shading="gouraud", rasterized=True, zorder=1)
 
     for rp in radar_positions:
-        ring = plt.Circle(rp, config.RADAR_RANGE,
-                          fill=False, edgecolor="#dc262688",
-                          linewidth=0.8, linestyle="--", zorder=2)
-        ax.add_patch(ring)
+        ax.add_patch(Circle(rp, config.ELINT_RANGE, fill=False,
+                            edgecolor="#f9731618", lw=0.6,
+                            linestyle=":", zorder=2))
 
-    ax.scatter(radar_positions[:, 0], radar_positions[:, 1],
-               s=60, c=C_RADAR, marker="^", zorder=4,
-               linewidths=0.8, edgecolors="#ffffff88")
+    ax.add_patch(Circle(config.MISSION_TARGET, config.TARGET_RADIUS,
+                        fill=True, facecolor="#22c55e18",
+                        edgecolor="#22c55e", lw=1.2, zorder=3))
+    ax.scatter(*config.MISSION_TARGET, s=80, c=SUCCESS_COL,
+               marker="*", zorder=10, edgecolors=BG, lw=0.8)
+    ax.scatter(*config.UAV_START_A, s=50, c=DRONE_A,
+               marker="o", zorder=10, edgecolors=BG, lw=1.0)
+    ax.scatter(*config.UAV_START_B, s=50, c=DRONE_B,
+               marker="D", zorder=10, edgecolors=BG, lw=1.0)
 
-    # Target
-    target_ring = plt.Circle(config.MISSION_TARGET, config.TARGET_RADIUS,
-                              fill=True, facecolor=C_TARGET + "44",
-                              edgecolor=C_TARGET, linewidth=1.5, zorder=3)
-    ax.add_patch(target_ring)
-    ax.scatter(*config.MISSION_TARGET, s=120, c=C_TARGET,
-               marker="*", zorder=5, edgecolors="#fff", linewidths=0.8)
+    trail_a, = ax.plot([], [], color=DRONE_A, lw=1.0, alpha=0.55, zorder=5)
+    trail_b, = ax.plot([], [], color=DRONE_B, lw=1.0, alpha=0.55, zorder=5)
+    dot_a,   = ax.plot([], [], "o", color=DRONE_A, ms=7, zorder=11,
+                       mec=BG, mew=1.0)
+    dot_b,   = ax.plot([], [], "D", color=DRONE_B, ms=6, zorder=11,
+                       mec=BG, mew=1.0)
 
-    # Start
-    ax.scatter(*config.UAV_START, s=80, c=C_UAV,
-               marker="o", zorder=5, edgecolors="#fff", linewidths=1.0,
-               alpha=0.6)
+    radar_sc = ax.scatter(radar_positions[:,0], radar_positions[:,1],
+                          s=22, c=[UNKNOWN_COL]*N, marker="^",
+                          zorder=6, edgecolors="none")
 
-    ax.set_xlim(0, L)
-    ax.set_ylim(0, L)
-    ax.set_aspect("equal")
-    ax.set_xlabel("$x_1$  [spatial units  ≈  km]",
-                  fontsize=9, color="#94a3b8")
-    ax.set_ylabel("$x_2$  [spatial units  ≈  km]",
-                  fontsize=9, color="#94a3b8")
-    ax.tick_params(colors="#64748b", labelsize=7)
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#334155")
-    ax.grid(True, linewidth=0.25, alpha=0.25, color="#94a3b8")
+    det_rings = [Circle(rp, config.RADAR_RANGE, fill=False,
+                        edgecolor=UNKNOWN_COL, lw=0.5,
+                        linestyle="--", zorder=4)
+                 for rp in radar_positions]
+    for r in det_rings: ax.add_patch(r)
 
-    # ── Dynamic elements (initialised empty) ──────────────────────────────────
-    trail_line, = ax.plot([], [], lw=1.2, color=C_TRAIL,
-                          alpha=0.6, zorder=6, solid_capstyle="round")
+    rc_a = ax.add_patch(Circle((0,0), config.ELINT_RANGE, fill=False,
+                                edgecolor=f"{DRONE_A}50", lw=0.6,
+                                linestyle=":", zorder=3))
+    rc_b = ax.add_patch(Circle((0,0), config.ELINT_RANGE, fill=False,
+                                edgecolor=f"{DRONE_B}50", lw=0.6,
+                                linestyle=":", zorder=3))
 
-    uav_dot, = ax.plot([], [], "o", ms=8, color=C_UAV,
-                       mec="#fff", mew=1.2, zorder=8)
+    # Legend
+    leg = ax.legend(handles=[
+        Line2D([0],[0], color=DRONE_A, lw=1.5, marker="o", ms=5,
+               label=f"Drone A  ({int(config.UAV_START_A[0])},{int(config.UAV_START_A[1])})"),
+        Line2D([0],[0], color=DRONE_B, lw=1.5, marker="D", ms=5,
+               label=f"Drone B  ({int(config.UAV_START_B[0])},{int(config.UAV_START_B[1])})"),
+    ], loc="upper left", fontsize=7, facecolor="#1e293b",
+       edgecolor=AXES_COL, labelcolor=TEXT_MID, framealpha=0.9)
 
-    detection_flash = plt.Circle((0, 0), 0, fill=True,
-                                 facecolor="#dc262633",
-                                 edgecolor=C_ALERT,
-                                 linewidth=1.5, zorder=7, visible=False)
-    ax.add_patch(detection_flash)
+    total_steps = rec["n_steps"]
 
-    det_markers, = ax.plot([], [], "x", ms=7, color=C_ALERT,
-                           mew=1.5, zorder=7, ls="none")
-    det_xs, det_ys = [], []
+    def _update(fi):
+        si  = step_idx[fi]
+        pa  = rec["positions_a"]
+        pb  = rec["positions_b"]
+        sh  = rec["known_shared"]
+        mask = sh[min(si, len(sh)-1)]
+        pda  = rec["pd_a"][min(si, len(rec["pd_a"])-1)]
+        pdb  = rec["pd_b"][min(si, len(rec["pd_b"])-1)]
 
-    # ── Status bar (bottom) ───────────────────────────────────────────────────
-    bar_ax = fig.add_axes([0.07, 0.03, 0.82, 0.072])
-    bar_ax.set_facecolor("#161b22")
-    bar_ax.set_xlim(0, 1)
-    bar_ax.set_ylim(0, 1)
-    bar_ax.axis("off")
+        lo = max(0, si-80)
+        ia = min(si, len(pa)-1); ib = min(si, len(pb)-1)
+        trail_a.set_data(pa[lo:ia+1, 0], pa[lo:ia+1, 1])
+        trail_b.set_data(pb[lo:ib+1, 0], pb[lo:ib+1, 1])
+        dot_a.set_data([pa[ia,0]], [pa[ia,1]])
+        dot_b.set_data([pb[ib,0]], [pb[ib,1]])
+        rc_a.center = pa[ia]; rc_b.center = pb[ib]
 
-    txt_step    = bar_ax.text(0.02, 0.62, "", fontsize=8.5,
-                              color="#94a3b8", va="center",
-                              fontfamily="monospace")
-    txt_pmax    = bar_ax.text(0.02, 0.22, "", fontsize=8.5,
-                              color="#94a3b8", va="center",
-                              fontfamily="monospace")
-    txt_outcome = bar_ax.text(0.5, 0.5, "", fontsize=11,
-                              color="#94a3b8", va="center", ha="center",
-                              fontweight="bold")
+        dot_a.set_color(DETECT_COL if pda>0.3 else "#f59e0b" if pda>0.1 else DRONE_A)
+        dot_b.set_color(DETECT_COL if pdb>0.3 else "#f59e0b" if pdb>0.1 else DRONE_B)
 
-    # P bar background
-    bar_ax.add_patch(mpatches.FancyBboxPatch(
-        (0.38, 0.15), 0.58, 0.35,
-        boxstyle="round,pad=0.01",
-        facecolor="#1e293b", edgecolor="#334155", lw=0.5))
-    p_bar_bg = bar_ax.add_patch(mpatches.FancyBboxPatch(
-        (0.385, 0.18), 0.0, 0.28,
-        boxstyle="square,pad=0",
-        facecolor=C_TRAIL, edgecolor="none"))
-    txt_p_label = bar_ax.text(0.385, 0.62, "P_max", fontsize=7,
-                              color="#64748b", va="center")
+        cols = [KNOWN_COL if mask[i] else UNKNOWN_COL for i in range(N)]
+        radar_sc.set_color(cols)
+        for i, ring in enumerate(det_rings):
+            if mask[i]:
+                ring.set_edgecolor(KNOWN_COL); ring.set_alpha(0.7)
+                ring.set_linewidth(0.9)
+            else:
+                ring.set_edgecolor(UNKNOWN_COL); ring.set_alpha(0.3)
+                ring.set_linewidth(0.4)
 
-    # ── Title ─────────────────────────────────────────────────────────────────
-    fig.text(0.5, 0.97,
-             f"AR3 ISR Mission Simulation  —  "
-             f"$N={n_radars}$ radars · seed {seed}",
-             ha="center", va="top", fontsize=10,
-             color="#e2e8f0", fontweight="500")
+        oa = rec["out_a"] if fi==len(step_idx)-1 else None
+        ob = rec["out_b"] if fi==len(step_idx)-1 else None
+        _update_hud_coop(hud_texts, bar_fill, bar_label,
+                         si, total_steps,
+                         pa[ia], pb[ib], pda, pdb,
+                         int(mask.sum()), N, out_a=oa, out_b=ob)
 
-    outcome_colour = {
-        "success":  C_SUCCESS,
-        "detected": C_DETECTED,
-        "timeout":  C_TIMEOUT,
-    }
+        return (trail_a, trail_b, dot_a, dot_b, radar_sc,
+                rc_a, rc_b, *hud_texts, *det_rings)
 
-    flash_radius_max = 12.0
-    flash_duration   = 12    # frames for the flash effect
-
-    def init():
-        trail_line.set_data([], [])
-        uav_dot.set_data([], [])
-        det_markers.set_data([], [])
-        detection_flash.set_visible(False)
-        txt_step.set_text("")
-        txt_pmax.set_text("")
-        txt_outcome.set_text("")
-        p_bar_bg.set_width(0.0)
-        return (trail_line, uav_dot, detection_flash,
-                det_markers, txt_step, txt_pmax, txt_outcome, p_bar_bg)
-
-    def update(frame):
-        # Hold on last frame
-        f = min(frame, n_frames - 1)
-        step = steps[f]
-
-        x, y   = step["x"], step["y"]
-        p_max  = step["p_max"]
-
-        # Trail
-        t_start = max(0, f - TRAIL_LEN)
-        txs     = [s["x"] for s in steps[t_start:f+1]]
-        tys     = [s["y"] for s in steps[t_start:f+1]]
-        trail_line.set_data(txs, tys)
-
-        # UAV dot colour — changes on detection
-        if step["detected"]:
-            uav_dot.set_color(C_ALERT)
-            det_xs.append(x)
-            det_ys.append(y)
-            det_markers.set_data(det_xs, det_ys)
-        else:
-            uav_dot.set_color(C_UAV)
-
-        uav_dot.set_data([x], [y])
-
-        # Detection flash — expanding ring
-        frames_since = f - (n_frames - 1) if outcome == "detected" else -1
-        if step["detected"]:
-            detection_flash.center = (x, y)
-            detection_flash.set_radius(flash_radius_max * 0.3)
-            detection_flash.set_visible(True)
-        elif f > 0 and steps[f-1]["detected"]:
-            detection_flash.set_visible(False)
-        else:
-            detection_flash.set_visible(False)
-
-        # Status bar text
-        elapsed_min = f * config.STEP_DURATION_S / 60
-        txt_step.set_text(
-            f"Step {f:>4d} / {config.MAX_STEPS}   "
-            f"│   t = {elapsed_min:>5.1f} min   "
-            f"│   pos = ({x:>6.1f}, {y:>5.1f})"
-        )
-        txt_pmax.set_text(f"Max P(d) this step: {p_max*100:>5.1f}%")
-
-        # P bar
-        bar_w = 0.565 * min(p_max, 1.0)
-        p_bar_bg.set_width(bar_w)
-        p_bar_bg.set_facecolor(
-            C_ALERT if p_max > 0.6 else
-            "#f97316" if p_max > 0.3 else
-            C_TRAIL
-        )
-
-        # Outcome message (only at the end)
-        if f == n_frames - 1:
-            msgs = {
-                "success":  "✓  Mission complete",
-                "detected": "✗  UAV detected",
-                "timeout":  "⚠  Mission timeout",
-            }
-            txt_outcome.set_text(msgs[outcome])
-            txt_outcome.set_color(outcome_colour[outcome])
-        else:
-            txt_outcome.set_text("")
-
-        return (trail_line, uav_dot, detection_flash,
-                det_markers, txt_step, txt_pmax, txt_outcome, p_bar_bg)
-
-    # Hold last frame for 60 extra frames
-    total_frames = n_frames + 60
-
-    anim = animation.FuncAnimation(
-        fig, update, frames=total_frames,
-        init_func=init, blit=True, interval=interval
-    )
-
-    if save:
-        path = os.path.join(config.FIGURES_DIR, "mission_animation.gif")
-        print(f"  Saving animation → {path}  (this may take ~30s...)")
-        writer = animation.PillowWriter(fps=30)
-        anim.save(path, writer=writer, dpi=110)
-        print(f"  Saved.")
-
-    if show:
-        plt.show()
-
-    return anim
+    ani = animation.FuncAnimation(fig, _update, frames=len(step_idx),
+                                  interval=1000//FPS, blit=True)
+    ani.save(output_path, writer="pillow", fps=FPS)
+    plt.close(fig)
+    print(f"  Saved → {output_path}")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Animate a single AR3 ISR mission."
-    )
-    parser.add_argument("--seed",   type=int, default=None,
-                        help="Random seed (default: config.RANDOM_SEED)")
-    parser.add_argument("--radars", type=int, default=8,
-                        help="Number of radar nodes (default: 8)")
-    parser.add_argument("--no-save", action="store_true",
-                        help="Skip saving the .gif")
-    parser.add_argument("--no-show", action="store_true",
-                        help="Skip plt.show()")
-    parser.add_argument("--interval", type=int, default=30,
-                        help="ms between frames (default: 30)")
+    import time as _t
 
-    args = parser.parse_args()
+    t0   = _t.time()
+    seed = 59        # verified: both_success on Gaussian AND Lévy, N=9
+    N_R  = 9
 
-    print("Running mission animation...")
-    animate(
-        n_radars = args.radars,
-        seed     = args.seed,
-        save     = not args.no_save,
-        show     = not args.no_show,
-        interval = args.interval,
-    )
+    print("Generating AR3 ISR mission animations")
+    print(f"  N={N_R} radars, seed={seed}, {N_FRAMES} frames @ {FPS}fps\n")
+
+    rng_sp = np.random.default_rng(seed)
+    L, mg  = config.GRID_SIZE, config.RADAR_RANGE * 0.5
+    rp     = rng_sp.uniform(mg, L-mg, size=(N_R, 2))
+    G      = build_network(rp, "ER", rng=rng_sp)
+
+    out    = config.FIGURES_DIR
+
+    print("[1/4] Solo — Gaussian...")
+    rec = record_solo(rp, G, np.random.default_rng(seed+1), "gaussian")
+    print(f"      {rec['outcome']}  steps={rec['n_steps']}  known={rec['known_masks'][-1].sum()}/{N_R}")
+    make_solo_gif(rec, rp, "Gaussian walk", seed,
+                  os.path.join(out, "solo_gaussian.gif"))
+
+    print("[2/4] Solo — Lévy...")
+    rec = record_solo(rp, G, np.random.default_rng(seed+2), "levy")
+    print(f"      {rec['outcome']}  steps={rec['n_steps']}  known={rec['known_masks'][-1].sum()}/{N_R}")
+    make_solo_gif(rec, rp, f"Lévy walk (μ={config.LEVY_ALPHA})", seed,
+                  os.path.join(out, "solo_levy.gif"))
+
+    print("[3/4] Cooperative — Gaussian...")
+    rec = record_coop(rp, G, np.random.default_rng(seed+3),
+                      np.random.default_rng(seed+4), "gaussian")
+    print(f"      A={rec['out_a']} B={rec['out_b']} ({rec['joint']})  shared={rec['known_shared'][-1].sum()}/{N_R}")
+    make_coop_gif(rec, rp, "Gaussian walk", seed,
+                  os.path.join(out, "coop_gaussian.gif"))
+
+    print("[4/4] Cooperative — Lévy...")
+    rec = record_coop(rp, G, np.random.default_rng(seed+5),
+                      np.random.default_rng(seed+6), "levy")
+    print(f"      A={rec['out_a']} B={rec['out_b']} ({rec['joint']})  shared={rec['known_shared'][-1].sum()}/{N_R}")
+    make_coop_gif(rec, rp, f"Lévy walk (μ={config.LEVY_ALPHA})", seed,
+                  os.path.join(out, "coop_levy.gif"))
+
+    print(f"\nDone in {(_t.time()-t0)/60:.1f} minutes.")
