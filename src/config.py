@@ -20,14 +20,16 @@ Temporal reference:
 
 GRID_SIZE       = 150        # side length of the square simulation domain [units]
 
-UAV_START       = (5.0, 5.0)          # Start position [units]
+UAV_START       = (5.0, 5.0)          # AR3 start position — solo missions
+UAV_START_A     = (5.0,  5.0)         # Drone A start — Stage 5 cooperative
+UAV_START_B     = (5.0, 30.0)         # Drone B start — 25 u lateral separation
 MISSION_TARGET  = (145.0, 145.0)      # mission objective position [units]
 TARGET_RADIUS   = 5.0                 # mission success if UAV reaches within this radius [units]
 
 # ─── Time ──────────────────────────────────────────────────────────────────────
 
 STEP_DURATION_S = 30         # real-world duration of one simulation step [seconds]
-MAX_STEPS       = 500        # maximum steps per trajectory (~4.2 h mission)
+MAX_STEPS       = 1200           # Before 500/800 MAX_STEPS       = 500        # maximum steps per trajectory (~4.2 h mission)
 
 # ─── UAV movement ──────────────────────────────────────────────────────────────
 
@@ -36,14 +38,14 @@ UAV_STEP_SIZE   = 0.65       # mean displacement per step [units]
                              # (AR3 cruise: ~90 km/h; 0.65 accounts for heading
                              #  corrections within each 30s interval)
 
-DRIFT_WEIGHT    = 0.65       # [0, 1] — how strongly the UAV biases toward the target
+DRIFT_WEIGHT    = 0.45   # era 0.65                     #DRIFT_WEIGHT    = 0.65       # [0, 1] — how strongly the UAV biases toward the target
                              # 1.0 = straight line; 0.0 = pure random walk
 
 # Lévy flight parameters (used in Stage 3 variant)
 LEVY_ALPHA      = 1.5        # stability index μ [1, 2]; 2 → Gaussian, 1 → Cauchy
                              # literature value for animal search: 1.4–2.0
                              # (Humphries et al., Nature 465, 2010)
-LEVY_S_MIN      = 0.1        # minimum step size for Lévy sampling [units]
+LEVY_S_MIN      = 0.4        # "Old = 0.1" minimum step size for Lévy sampling [units]
 LEVY_S_MAX      = 5.0        # maximum step size [units] → ~600 km/h physical ceiling
 
 # ─── Radar network ─────────────────────────────────────────────────────────────
@@ -58,8 +60,8 @@ DETECTION_LAMBDA    = 6.0    # decay length [units]; controls how steeply P drop
 DETECTION_NOISE_STD = 0.05   # std of additive Gaussian noise on P(d); models sensor imperfection
 
 # Radar density sweep (Stage 4 — phase transition)
-RHO_MIN         = 0.001      # min radar density [radars / unit²]
-RHO_MAX         = 0.015      # max radar density [radars / unit²]
+RHO_MIN         = 0.0002      # min radar density [radars / unit²]
+RHO_MAX         = 0.004      # max radar density [radars / unit²]
 RHO_STEPS       = 30         # number of density values to sweep
 
 # ─── Network topologies (Stage 2) ──────────────────────────────────────────────
@@ -88,11 +90,21 @@ PASSIVE_RANGE   = 6.0        # radius within which UAV passively detects a radar
                              # shorter than RADAR_RANGE: the drone sees less than it is seen
 PASSIVE_BETA    = None       # evasion weight β — calibrated empirically in Stage 5
 
+ELINT_RANGE     = 14.0       # ELINT detection radius [units] > RADAR_RANGE = 10
+                             # AR3 intercepts radar emissions before entering coverage zone
+                             # margin = ELINT_RANGE - RADAR_RANGE = 4 u → forces aggressive
+                             # evasive manoeuvres at the boundary of detection zones
+                             # (physically: radar pulses propagate ~2× further than detection range)
+ELINT_BETA      = 0.41        # initial evasion weight β — calibrated in uav_elint_trajectory.py
+
 # ─── Ensemble / Monte Carlo ────────────────────────────────────────────────────
 
 N_TRAJECTORIES  = 1000       # trajectories per condition (statistical robustness)
-N_PHASE_RUNS    = 500        # trajectories per density value in phase transition sweep
+N_PHASE_RUNS    = 1000        # trajectories per density value in phase transition sweep
 RANDOM_SEED     = 42         # global seed for reproducibility (set None to disable)
+
+# ─── Parallelisation ──────────────────────────────────────────────────────────
+N_JOBS = -1   # -1 = usa todos os cores disponíveis
 
 # ─── Output paths ──────────────────────────────────────────────────────────────
 
